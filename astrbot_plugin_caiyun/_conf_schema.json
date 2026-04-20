@@ -1,0 +1,86 @@
+{
+  "sms_api_base_url": {
+    "type": "string",
+    "description": "短信登录 API 地址",
+    "default": "https://ydyp.apisky.cn"
+  },
+  "qinglong_url": {
+    "type": "string",
+    "description": "青龙面板地址",
+    "hint": "例如 http://127.0.0.1:5700",
+    "default": ""
+  },
+  "qinglong_client_id": {
+    "type": "string",
+    "description": "青龙 Client ID",
+    "default": ""
+  },
+  "qinglong_client_secret": {
+    "type": "string",
+    "description": "青龙 Client Secret",
+    "default": ""
+  },
+  "qinglong_env_name": {
+    "type": "string",
+    "description": "同步到青龙时使用的环境变量名",
+    "default": "Gk_yunpan"
+  },
+  "daidai_url": {
+    "type": "string",
+    "description": "呆呆面板地址",
+    "hint": "例如 http://127.0.0.1:8080，填写后优先使用呆呆面板同步",
+    "default": ""
+  },
+  "daidai_app_key": {
+    "type": "string",
+    "description": "呆呆面板 App Key",
+    "default": ""
+  },
+  "daidai_app_secret": {
+    "type": "string",
+    "description": "呆呆面板 App Secret",
+    "default": ""
+  },
+  "daidai_env_name": {
+    "type": "string",
+    "description": "同步到呆呆面板时使用的环境变量名",
+    "default": "Gk_yunpan"
+  },
+  "user_agent": {
+    "type": "text",
+    "description": "请求移动云盘接口时使用的 User-Agent",
+    "default": "Mozilla/5.0 (Linux; Android 13; 23049RAD8C Build/TKQ1.221114.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/108.0.5359.128 Mobile Safari/537.36 MCloudApp/12.4.0 AppLanguage/zh-CN"
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "HTTP 请求超时时间（秒）",
+    "default": 15
+  },
+  "admin_user_ids": {
+    "type": "list",
+    "description": "允许执行“云盘一键检测”的用户 ID 列表",
+    "hint": "留空则不额外限制，填写后仅列表内用户可执行",
+    "default": []
+  },
+  "batch_check_concurrency": {
+    "type": "int",
+    "description": "后台批量检测并发数",
+    "default": 5
+  },
+  "scheduled_check_enabled": {
+    "type": "bool",
+    "description": "是否启用定时自动检测账号有效性",
+    "default": false
+  },
+  "scheduled_check_hour": {
+    "type": "int",
+    "description": "每天定时检测的小时（0-23）",
+    "hint": "例如 8 表示每天早上 8 点执行检测",
+    "default": 8
+  },
+  "scheduled_check_minute": {
+    "type": "int",
+    "description": "每天定时检测的分钟（0-59）",
+    "default": 0
+  }
+}
