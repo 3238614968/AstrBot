@@ -2,6 +2,6 @@ name: astrbot_plugin_caiyun
 display_name: 移动云盘
 author: XiaoHai
 desc: 移动云盘 CK/商品/抢兑/查询/管理插件。支持短信登录、CK管理、商品查询、自动抢兑、定时检测、面板同步等功能。
-version: 0.3.0
+version: 0.4.0
 repo: https://example.com/caiyun
 astrbot_version: ">=4.16,<5"

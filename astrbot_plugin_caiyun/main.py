@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -23,6 +25,19 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/108.0.5359.128 "
     "Mobile Safari/537.36 MCloudApp/12.4.0 AppLanguage/zh-CN"
 )
+
+_MARKET_UA_POOL = [
+    "Mozilla/5.0 (Linux; Android 14; 23127HN0CC Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/143.0.7499.146 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 14; 24053PY09C Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/142.0.6522.118 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 13; 23049RAD8C Build/TKQ1.221114.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/143.0.7499.146 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 14; PGP110 Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/141.0.6464.127 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 14; RMXP4721 Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/143.0.7499.146 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 13; M2012K10C Build/RP1A.200720.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/142.0.6522.118 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 14; V2324A Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/143.0.7499.146 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 13; RE58B1 Build/TKQ1.221114.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/140.0.6385.82 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/143.0.7499.146 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+    "Mozilla/5.0 (Linux; Android 14; LLY-AN00 Build/HONORLLY-AN00; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/142.0.6522.118 Mobile Safari/537.36 MCloudApp/12.5.4 AppLanguage/zh-CN",
+]
 PHONE_RE = re.compile(r"^1\d{10}$")
 CK_RE = re.compile(r"^Basic\s+([^#]{1,300})#(\d{11})$")
 
@@ -179,9 +194,16 @@ class YunpanHttpClient:
     def _user_agent(self) -> str:
         return str(self._config().get("user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT)
 
+    _MARKET_BASE_URL = "https://m.mcloud.139.com"
+    _MARKET_SOURCE_ID = "1097"
+
+    def _random_market_ua(self) -> str:
+        return random.choice(_MARKET_UA_POOL)
+
     def _mcloud_headers(self, jwt_token: str | None = None) -> dict[str, str]:
         headers = {
             "User-Agent": self._user_agent(),
+            "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate",
             "showloading": "true",
             "x-requested-with": "com.chinamobile.mcloud",
@@ -194,6 +216,79 @@ class YunpanHttpClient:
             headers["jwttoken"] = jwt_token
         return headers
 
+    @staticmethod
+    def _extract_user_domain_id(jwt_token: str) -> str:
+        try:
+            payload = jwt_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload).decode())
+            sub = data.get("sub", "")
+            if isinstance(sub, str):
+                sub = json.loads(sub)
+            return str(sub.get("userDomainId", ""))
+        except Exception:
+            return ""
+
+    def _build_market_page_url(self, source_id: str | None = None, sso_token: str = "") -> str:
+        sid = source_id or self._MARKET_SOURCE_ID
+        return f"{self._MARKET_BASE_URL}/portal/mobilecloud/index.html?path=newsignin&sourceid={sid}&enableShare=1&token={sso_token}&targetSourceId=001005"
+
+    def _build_market_headers(self, jwt_token: str, user_domain_id: str = "") -> dict[str, str]:
+        headers = {
+            "User-Agent": self._random_market_ua(),
+            "Accept": "*/*",
+            "jwtToken": jwt_token,
+            "X-Requested-With": "com.chinamobile.mcloud",
+            "Referer": self._build_market_page_url(),
+        }
+        if user_domain_id:
+            headers["userDomainId"] = user_domain_id
+        return headers
+
+    async def _post_journaling(self, jwt_token: str, keyword: str, source_id: str | None = None) -> None:
+        sid = source_id or self._MARKET_SOURCE_ID
+        payload = f"module=uservisit&optkeyword={keyword}&sourceid={sid}&marketName=sign_in_3"
+        try:
+            self._client.cookies.clear()
+            await self._client.request(
+                "POST",
+                f"{self._MARKET_BASE_URL}/ycloud/visitlog/journaling",
+                headers={
+                    **self._build_market_headers(jwt_token),
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Referer": self._build_market_page_url(sid),
+                },
+                content=payload,
+                timeout=self._timeout(),
+            )
+        except Exception:
+            pass
+
+    async def prepare_market_session(self, jwt_token: str) -> str:
+        user_domain_id = self._extract_user_domain_id(jwt_token)
+        page_url = self._build_market_page_url()
+        try:
+            self._client.cookies.clear()
+            await self._client.request(
+                "GET",
+                page_url,
+                headers=self._build_market_headers(jwt_token, user_domain_id),
+                timeout=self._timeout(),
+            )
+        except Exception:
+            pass
+        for keyword in (
+            "newsignin_index_pv",
+            "newsignin_index_client",
+            "newsignin_index_app_client",
+            "newsignin_index_cookie_login",
+            "newsignin_index_cookie",
+            "newsignin_index_app_cookie_login",
+        ):
+            await self._post_journaling(jwt_token, keyword)
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+        return user_domain_id
+
     async def _request_json(
         self,
         method: str,
@@ -203,6 +298,7 @@ class YunpanHttpClient:
         params: dict[str, Any] | None = None,
         json_body: Any = None,
     ) -> Any:
+        self._client.cookies.clear()
         response = await self._client.request(
             method,
             url,
@@ -402,28 +498,57 @@ class YunpanHttpClient:
     async def query_cloud_record(self, jwt_token: str) -> dict[str, Any]:
         data = await self._request_json(
             "GET",
-            "https://m.mcloud.139.com/market/signin/public/cloudRecord?type=0&pageNumber=1&pageSize=10",
-            headers=self._mcloud_headers(jwt_token),
+            f"{self._MARKET_BASE_URL}/market/signin/public/cloudRecord?type=0&pageNumber=1&pageSize=10",
+            headers=self._build_market_headers(jwt_token),
         )
         if data.get("code") != 0:
             raise ValueError(f"接口返回错误：{data.get('msg') or '未知错误'}")
         return data
 
     async def query_sign_info(self, jwt_token: str) -> dict[str, Any]:
-        data = await self._request_json(
+        check_data = await self._request_json(
             "GET",
-            "https://m.mcloud.139.com/market/signin/page/startSignIn?client=app",
-            headers=self._mcloud_headers(jwt_token),
+            f"{self._MARKET_BASE_URL}/market/signin/page/infoV3?client=app",
+            headers=self._build_market_headers(jwt_token),
         )
-        if data.get("code") != 0 and data.get("msg") != "success":
-            raise ValueError(f"接口返回错误：{data.get('msg') or '未知错误'}")
-        return data
+        if check_data.get("code") == 0:
+            result = check_data.get("result") or {}
+            today_sign_in = result.get("todaySignIn")
+            is_signed = today_sign_in is True or today_sign_in == "true" or today_sign_in == 1
+            if is_signed:
+                return check_data
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        signin_data = await self._request_json(
+            "GET",
+            f"{self._MARKET_BASE_URL}/market/signin/page/startSignIn?client=app",
+            headers=self._build_market_headers(jwt_token),
+        )
+        if signin_data.get("code") == 0:
+            result = signin_data.get("result") or {}
+            today_sign_in = result.get("todaySignIn")
+            is_signed = today_sign_in is True or today_sign_in == "true" or today_sign_in == 1
+            if is_signed:
+                return signin_data
+        latest_data = await self._request_json(
+            "GET",
+            f"{self._MARKET_BASE_URL}/market/signin/page/infoV3?client=app",
+            headers=self._build_market_headers(jwt_token),
+        )
+        if latest_data.get("code") == 0:
+            result = latest_data.get("result") or {}
+            today_sign_in = result.get("todaySignIn")
+            is_signed = today_sign_in is True or today_sign_in == "true" or today_sign_in == 1
+            if is_signed:
+                return latest_data
+        if signin_data.get("code") != 0 and signin_data.get("msg") != "success":
+            raise ValueError(f"接口返回错误：{signin_data.get('msg') or '未知错误'}")
+        return signin_data
 
     async def query_cloud_total(self, jwt_token: str) -> dict[str, Any]:
         data = await self._request_json(
             "GET",
-            "https://m.mcloud.139.com/market/signin/page/infoV3?client=app",
-            headers=self._mcloud_headers(jwt_token),
+            f"{self._MARKET_BASE_URL}/market/signin/page/infoV3?client=app",
+            headers=self._build_market_headers(jwt_token),
         )
         if data.get("code") != 0:
             raise ValueError(f"接口返回错误：{data.get('msg') or '未知错误'}")
@@ -432,12 +557,12 @@ class YunpanHttpClient:
     async def query_prize_record(self, jwt_token: str) -> dict[str, Any]:
         data = await self._request_json(
             "GET",
-            "https://m.mcloud.139.com/ycloud/prizeApi/checkPrize/getUserPrizeLogPageV2",
-            headers=self._mcloud_headers(jwt_token),
+            f"{self._MARKET_BASE_URL}/ycloud/prizeApi/checkPrize/getUserPrizeLogPageV2",
+            headers=self._build_market_headers(jwt_token),
             params={"currPage": 1, "pageSize": 10},
         )
         if data.get("code") != 0:
-            raise ValueError(f"???????{data.get('msg') or '????'}")
+            raise ValueError(f"接口返回错误：{data.get('msg') or '未知错误'}")
         return data
 
 
@@ -1369,6 +1494,8 @@ class YidongYunpanPlugin(Star):
             await self._send_text(event, "❌ 您还没有上传任何CK\n\n请先发送「云盘登录」添加CK")
             return
         for index, metadata in enumerate(metadata_list, start=1):
+            if index > 1:
+                await asyncio.sleep(random.uniform(2, 4))
             account_label = self._get_account_label(metadata, index)
             ck = await self.store.get(BUCKET_TOKEN, metadata.token_key, "")
             if not ck:
@@ -1377,46 +1504,62 @@ class YidongYunpanPlugin(Star):
             try:
                 _, phone = parse_ck_from_string(str(ck))
                 jwt_token = await self._get_jwt_from_ck(str(ck))
+                await self.http.prepare_market_session(jwt_token)
+                await asyncio.sleep(random.uniform(0.5, 1.0))
             except Exception as exc:
                 await self._send_text(event, f"❌ {account_label} - 获取令牌失败：{sanitize_error(exc)}")
                 continue
-            cloud_result, sign_result, prize_result, total_result = await asyncio.gather(
-                self.http.query_cloud_record(jwt_token),
-                self.http.query_sign_info(jwt_token),
-                self.http.query_prize_record(jwt_token),
-                self.http.query_cloud_total(jwt_token),
-                return_exceptions=True,
-            )
+            cloud_result = None
+            sign_data = None
+            prize_data = None
+            total_clouds = 0
+            is_signed = False
             errors: list[str] = []
+            try:
+                info_result = await self.http.query_cloud_total(jwt_token)
+                total_clouds = int((info_result.get("result") or {}).get("total") or 0)
+                result_body = info_result.get("result") or {}
+                today_sign_in = result_body.get("todaySignIn")
+                is_signed = today_sign_in is True or today_sign_in == "true" or today_sign_in == 1 or str(today_sign_in).lower() == "true"
+                sign_data = info_result
+            except Exception as exc:
+                errors.append(f"签到信息: {sanitize_error(exc)}")
+            if not is_signed:
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+                try:
+                    signin_result = await self.http._request_json(
+                        "GET",
+                        f"{self.http._MARKET_BASE_URL}/market/signin/page/startSignIn?client=app",
+                        headers=self.http._build_market_headers(jwt_token),
+                    )
+                    if signin_result.get("code") == 0:
+                        result_body = signin_result.get("result") or {}
+                        today_sign_in = result_body.get("todaySignIn")
+                        is_signed = today_sign_in is True or today_sign_in == "true" or today_sign_in == 1 or str(today_sign_in).lower() == "true"
+                        if is_signed:
+                            sign_data = signin_result
+                except Exception as exc:
+                    errors.append(f"签到执行: {sanitize_error(exc)}")
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            try:
+                cloud_result = await self.http.query_cloud_record(jwt_token)
+            except Exception as exc:
+                errors.append(f"云朵记录: {sanitize_error(exc)}")
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            try:
+                prize_data = await self.http.query_prize_record(jwt_token)
+            except Exception as exc:
+                errors.append(f"待领奖品: {sanitize_error(exc)}")
             today_cloud = 0
-            if isinstance(cloud_result, Exception):
-                errors.append(f"云朵记录: {sanitize_error(cloud_result)}")
+            if cloud_result is None:
                 cloud_data = None
             else:
                 cloud_data = cloud_result
                 today_cloud = self._calculate_today_cloud(cloud_data)
-            if isinstance(sign_result, Exception):
-                errors.append(f"签到信息: {sanitize_error(sign_result)}")
-                sign_data = None
-            else:
-                sign_data = sign_result
-            if isinstance(prize_result, Exception):
-                errors.append(f"待领奖品: {sanitize_error(prize_result)}")
-                prize_data = None
-            else:
-                prize_data = prize_result
-            if isinstance(total_result, Exception):
-                total_clouds = 0
-            else:
-                total_clouds = int((total_result.get("result") or {}).get("total") or 0)
             message = "=====账号信息=====\n"
             message += f"👤 账号: {account_label}\n📱 手机: {mask_phone(phone)}\n"
             if sign_data:
-                sign_body = sign_data.get("result") or {}
                 message += f"💰 当前云朵: {total_clouds}\n"
-                # 处理 todaySignIn 可能是字符串或布尔值的情况
-                today_sign_in = sign_body.get("todaySignIn")
-                is_signed = today_sign_in is True or today_sign_in == "true" or today_sign_in == 1 or str(today_sign_in).lower() == "true"
                 message += "✅ 签到状态: 已签到\n" if is_signed else "📝 签到状态: 未签到\n"
             else:
                 message += f"💰 当前云朵: {total_clouds}\n📝 签到状态: 查询失败\n"
