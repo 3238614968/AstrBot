@@ -1,8 +1,9 @@
 {
   "sms_api_base_url": {
     "type": "string",
-    "description": "短信登录 API 地址",
-    "default": "https://ydyp.apisky.cn"
+    "description": "短信登录 & 滑块识别 API 地址",
+    "hint": "短信登录: /api/sms/send 和 /api/sms/verify；滑块识别: /api/sms/solve",
+    "default": "http://yunpan.apisky.cn"
   },
   "qinglong_url": {
     "type": "string",
@@ -58,8 +59,8 @@
   },
   "admin_user_ids": {
     "type": "list",
-    "description": "允许执行“云盘一键检测”的用户 ID 列表",
-    "hint": "留空则不额外限制，填写后仅列表内用户可执行",
+    "description": "管理员用户 ID 列表（可执行云盘一键检测、云盘一键抢兑等管理指令）",
+    "hint": "留空则不额外限制，填写后仅列表内用户可执行管理指令",
     "default": []
   },
   "batch_check_concurrency": {
@@ -82,5 +83,27 @@
     "type": "int",
     "description": "每天定时检测的分钟（0-59）",
     "default": 0
+  },
+  "scheduled_refresh_enabled": {
+    "type": "bool",
+    "description": "是否启用定时自动刷新即将过期的 Token（有效期低于5天自动刷新）",
+    "default": true
+  },
+  "scheduled_refresh_hour": {
+    "type": "int",
+    "description": "每天定时刷新 Token 的小时（0-23）",
+    "hint": "默认 10 点半执行刷新检测",
+    "default": 10
+  },
+  "scheduled_refresh_minute": {
+    "type": "int",
+    "description": "每天定时刷新 Token 的分钟（0-59）",
+    "default": 30
+  },
+  "refresh_notify_group_id": {
+    "type": "string",
+    "description": "Token 刷新结果通知的群聊 ID",
+    "hint": "留空则不发送群聊通知。填写后会将汇总结果发送到指定群聊",
+    "default": "599523323"
   }
 }

@@ -485,15 +485,208 @@ class YunpanHttpClient:
             raise ValueError(f"接口返回错误：{data.get('msg') or '未知错误'}")
         return data
 
-    async def do_exchange(self, jwt_token: str, prize_id: str) -> dict[str, Any]:
+    async def get_slide_captcha(self, jwt_token: str) -> dict[str, str] | None:
+        """获取滑块验证码图片"""
         data = await self._request_json(
-            "GET",
-            f"https://m.mcloud.139.com/market/signin/page/exchange?prizeId={prize_id}&client=app&clientVersion=12.4.0&smsCode=",
-            headers=self._mcloud_headers(jwt_token),
+            "POST",
+            f"{self._MARKET_BASE_URL}/ycloud/auth-service/slide/getSlide",
+            headers={
+                **self._build_market_headers(jwt_token),
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
         )
-        if data.get("msg") != "success":
-            raise ValueError(f"兑换失败：{data.get('msg') or '未知错误'}")
-        return data
+        if data.get("code") != 0:
+            logger.warning("获取滑块验证码失败: %s", data.get("msg", "未知错误"))
+            return None
+        result = data.get("result") or {}
+        puzzle_b64 = result.get("puzzle", "")
+        picture_b64 = result.get("picture", "")
+        if not puzzle_b64 or not picture_b64:
+            logger.warning("获取滑块验证码失败: 图片数据为空")
+            return None
+        return {"puzzle": puzzle_b64, "picture": picture_b64}
+
+    async def solve_slide(self, puzzle_b64: str, picture_b64: str) -> int | None:
+        """通过 API 识别滑块偏移量（复用 sms_api_base_url）"""
+        config = self._config()
+        api_url = str(config.get("sms_api_base_url", "http://yunpan.apisky.cn") or "http://yunpan.apisky.cn").rstrip("/")
+        try:
+            data = await self._request_json(
+                "POST",
+                f"{api_url}/api/sms/solve",
+                json_body={"puzzle": puzzle_b64, "picture": picture_b64},
+            )
+            if data.get("code") == 0 and data.get("data"):
+                offset = data["data"].get("offset")
+                confidence = data["data"].get("confidence", 0)
+                method = data["data"].get("method", "")
+                if offset is not None:
+                    # logger.info("滑块识别结果: 偏移量=%s, 置信度=%.4f, 方法=%s", offset, confidence, method)
+                    return int(offset)
+            logger.warning("滑块识别失败: %s", data.get("message", data))
+            return None
+        except Exception:
+            logger.exception("滑块识别 API 异常")
+            return None
+
+    async def do_exchange(self, jwt_token: str, prize_id: str) -> dict[str, Any]:
+        """兑换商品（带滑块验证码处理）"""
+        # 先获取滑块验证码
+        offset = None
+        for slide_attempt in range(3):
+            slide_data = await self.get_slide_captcha(jwt_token)
+            if not slide_data:
+                logger.warning("第%d次获取滑块验证码失败", slide_attempt + 1)
+                await asyncio.sleep(1)
+                continue
+            offset = await self.solve_slide(slide_data["puzzle"], slide_data["picture"])
+            if offset is not None:
+                break
+            logger.warning("第%d次滑块识别失败", slide_attempt + 1)
+            await asyncio.sleep(1)
+
+        if offset is not None:
+            final_offset = offset + random.randint(-3, 3)
+            # logger.info("最终偏移量: %d", final_offset)
+            data = await self._request_json(
+                "GET",
+                f"{self._MARKET_BASE_URL}/ycloud/signin/page/exchangeV2",
+                headers=self._build_market_headers(jwt_token),
+                params={
+                    "prizeId": prize_id,
+                    "client": "app",
+                    "clientVersion": "13.0.0",
+                    "puzzleOffset": final_offset,
+                    "smsCode": "",
+                },
+            )
+        else:
+            logger.warning("滑块识别全部失败，尝试无滑块兑换")
+            data = await self._request_json(
+                "GET",
+                f"https://m.mcloud.139.com/market/signin/page/exchange?prizeId={prize_id}&client=app&clientVersion=12.4.0&smsCode=",
+                headers=self._mcloud_headers(jwt_token),
+            )
+
+        if data.get("code") == 0:
+            return data
+        msg = data.get("msg") or data.get("message") or "未知错误"
+        if data.get("msg") == "success":
+            return data
+        raise ValueError(f"兑换失败：{msg}")
+
+    async def refresh_authorization(self, authorization: str, phone: str) -> str | None:
+        """刷新 authorization"""
+        try:
+            data = await self._request_json(
+                "POST",
+                "https://user-njs.yun.139.com/user/auth/refreshToken",
+                headers={
+                    "Authorization": authorization if authorization.startswith("Basic ") else f"Basic {authorization}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "okhttp/4.12.0",
+                    "Accept": "*/*",
+                },
+            )
+            new_auth = self._find_authorization_deep(data)
+            if not new_auth:
+                logger.warning("刷新Token 返回不可直接解析: %s", str(data)[:120])
+                return None
+            parsed = self._parse_token_key(new_auth)
+            if parsed.get("phone") and parsed["phone"] != phone:
+                logger.warning("刷新Token 返回账号不匹配: %s != %s", parsed["phone"], phone)
+                return None
+            old_parsed = self._parse_token_key(authorization)
+            if parsed.get("expireAt") and parsed["expireAt"] <= old_parsed.get("expireAt", 0):
+                logger.info("获取新 authorization 未比旧值更新")
+                return None
+            if not new_auth.startswith("Basic "):
+                new_auth = f"Basic {new_auth}"
+            return new_auth
+        except Exception:
+            logger.exception("刷新Token 失败")
+            return None
+
+    @staticmethod
+    def _find_authorization_deep(value: Any, depth: int = 0) -> str:
+        """从嵌套结构中深度查找 authorization"""
+        if depth > 5 or value is None:
+            return ""
+        if isinstance(value, str):
+            candidate = YunpanHttpClient._normalize_authorization(value)
+            if candidate:
+                return candidate
+            try:
+                return YunpanHttpClient._find_authorization_deep(json.loads(value), depth + 1)
+            except (json.JSONDecodeError, ValueError):
+                return ""
+        if isinstance(value, list):
+            for item in value:
+                found = YunpanHttpClient._find_authorization_deep(item, depth + 1)
+                if found:
+                    return found
+            return ""
+        if isinstance(value, dict):
+            for key in ("authorization", "Authorization", "token", "tokenKey", "data", "result", "value", "body"):
+                if key in value:
+                    found = YunpanHttpClient._find_authorization_deep(value[key], depth + 1)
+                    if found:
+                        return found
+            for v in value.values():
+                found = YunpanHttpClient._find_authorization_deep(v, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    @staticmethod
+    def _normalize_authorization(candidate: str) -> str:
+        """验证并规范化 authorization 字符串"""
+        if not candidate or not isinstance(candidate, str):
+            return ""
+        trimmed = candidate.strip().strip('"')
+        if not trimmed:
+            return ""
+        parsed = YunpanHttpClient._parse_token_key(trimmed)
+        if parsed.get("type") in ("mobile", "pc", "ph5") and parsed.get("phone") and re.match(r"^1\d{10}$", parsed["phone"]):
+            return trimmed if trimmed.startswith("Basic ") else f"Basic {trimmed}"
+        return ""
+
+    @staticmethod
+    def _parse_token_key(authorization: str) -> dict[str, Any]:
+        """解析 authorization 中的票据信息"""
+        try:
+            raw = authorization.replace("Basic ", "").strip()
+            decoded = base64.b64decode(raw).decode("utf-8", errors="replace")
+            parts = decoded.split(":")
+            type_ = parts[0] if parts else "unknown"
+            phone = parts[1] if len(parts) > 1 else ""
+            pipe_parts = decoded.split("|")
+            expire_at = int(pipe_parts[3]) if len(pipe_parts) > 3 else 0
+            return {"raw": raw, "decoded": decoded, "type": type_, "phone": phone, "expireAt": expire_at}
+        except Exception:
+            return {"raw": "", "decoded": "", "type": "unknown", "phone": "", "expireAt": 0}
+
+    @staticmethod
+    def is_token_expiring_soon(authorization: str, threshold_days: int = 5) -> bool:
+        """检查 authorization 是否即将过期"""
+        parsed = YunpanHttpClient._parse_token_key(authorization)
+        expire_at = parsed.get("expireAt", 0)
+        if not expire_at:
+            return False
+        diff_ms = expire_at - int(time.time() * 1000)
+        return 0 < diff_ms <= threshold_days * 24 * 60 * 60 * 1000
+
+    @staticmethod
+    def format_expire_time(authorization: str) -> str:
+        """格式化 authorization 的过期时间"""
+        parsed = YunpanHttpClient._parse_token_key(authorization)
+        expire_at = parsed.get("expireAt", 0)
+        if not expire_at:
+            return "未知"
+        try:
+            return datetime.fromtimestamp(expire_at / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "未知"
 
     async def query_cloud_record(self, jwt_token: str) -> dict[str, Any]:
         data = await self._request_json(
@@ -669,6 +862,8 @@ class YidongYunpanPlugin(Star):
         self.http = YunpanHttpClient(self._runtime_config)
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._track_task(self._scheduled_check_loop())
+        self._track_task(self._scheduled_refresh_loop())
+        self._track_task(self._scheduled_exchange_loop())
 
     async def terminate(self):
         for task in list(self._background_tasks):
@@ -679,7 +874,7 @@ class YidongYunpanPlugin(Star):
 
     def _runtime_config(self) -> dict[str, Any]:
         return {
-            "sms_api_base_url": str(self.config.get("sms_api_base_url", "https://smscaiyun.779776.xyz") or "https://smscaiyun.779776.xyz"),
+            "sms_api_base_url": str(self.config.get("sms_api_base_url", "http://yunpan.apisky.cn") or "http://yunpan.apisky.cn"),
             "qinglong_url": str(self.config.get("qinglong_url", "") or ""),
             "qinglong_client_id": str(self.config.get("qinglong_client_id", "") or ""),
             "qinglong_client_secret": str(self.config.get("qinglong_client_secret", "") or ""),
@@ -692,6 +887,13 @@ class YidongYunpanPlugin(Star):
             "request_timeout_seconds": int(self.config.get("request_timeout_seconds", 15) or 15),
             "admin_user_ids": [str(item).strip() for item in (self.config.get("admin_user_ids", []) or []) if str(item).strip()],
             "batch_check_concurrency": max(1, int(self.config.get("batch_check_concurrency", 5) or 5)),
+            "scheduled_check_enabled": bool(self.config.get("scheduled_check_enabled", False)),
+            "scheduled_check_hour": max(0, min(23, int(self.config.get("scheduled_check_hour", 8) or 8))),
+            "scheduled_check_minute": max(0, min(59, int(self.config.get("scheduled_check_minute", 0) or 0))),
+            "scheduled_refresh_enabled": bool(self.config.get("scheduled_refresh_enabled", True)),
+            "scheduled_refresh_hour": max(0, min(23, int(self.config.get("scheduled_refresh_hour", 10) or 10))),
+            "scheduled_refresh_minute": max(0, min(59, int(self.config.get("scheduled_refresh_minute", 30) or 30))),
+            "refresh_notify_group_id": str(self.config.get("refresh_notify_group_id", "599523323") or "").strip(),
         }
 
     def _track_task(self, coro):
@@ -700,7 +902,17 @@ class YidongYunpanPlugin(Star):
         task.add_done_callback(lambda current: self._background_tasks.discard(current))
         return task
 
+    async def _wait_until(self, hour: int, minute: int) -> None:
+        """等待到指定时间，如果已过则等待到明天"""
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+
     async def _scheduled_check_loop(self) -> None:
+        """定时检测 CK 有效性"""
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
@@ -711,17 +923,12 @@ class YidongYunpanPlugin(Star):
                 await asyncio.sleep(60)
                 continue
             try:
-                hour = max(0, min(23, int(config.get("scheduled_check_hour", 8) or 8)))
-                minute = max(0, min(59, int(config.get("scheduled_check_minute", 0) or 0)))
+                hour = config.get("scheduled_check_hour", 8)
+                minute = config.get("scheduled_check_minute", 0)
             except (ValueError, TypeError):
                 hour, minute = 8, 0
-            now = datetime.now()
-            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-            wait_seconds = (target - now).total_seconds()
             try:
-                await asyncio.sleep(wait_seconds)
+                await self._wait_until(hour, minute)
             except asyncio.CancelledError:
                 return
             logger.info("定时检测任务开始执行")
@@ -736,6 +943,155 @@ class YidongYunpanPlugin(Star):
                             await self._send_to_origin(admin_origin, message)
             except Exception:
                 logger.exception("定时检测任务执行失败")
+
+    async def _scheduled_refresh_loop(self) -> None:
+        """定时刷新即将过期的 Token（每天上午10:30执行）"""
+        try:
+            await asyncio.sleep(35)
+        except asyncio.CancelledError:
+            return
+        while True:
+            config = self._runtime_config()
+            if not config.get("scheduled_refresh_enabled"):
+                await asyncio.sleep(60)
+                continue
+            try:
+                hour = config.get("scheduled_refresh_hour", 10)
+                minute = config.get("scheduled_refresh_minute", 30)
+            except (ValueError, TypeError):
+                hour, minute = 10, 30
+            try:
+                await self._wait_until(hour, minute)
+            except asyncio.CancelledError:
+                return
+            logger.info("定时刷新 Token 任务开始执行")
+            try:
+                await self._run_scheduled_refresh()
+            except Exception:
+                logger.exception("定时刷新 Token 任务执行失败")
+
+    async def _run_scheduled_refresh(self) -> None:
+        """执行 Token 刷新：遍历所有账号，有效期低于5天的自动刷新，汇总通知到群聊"""
+        all_user_ids = await self.store.all_keys(BUCKET_USER)
+        refreshed_count = 0
+        failed_count = 0
+        skipped_count = 0
+        total_accounts = 0
+        for user_id in all_user_ids:
+            metadata_list = await self._get_user_metadata(user_id)
+            for metadata in metadata_list:
+                total_accounts += 1
+                ck = await self.store.get(BUCKET_TOKEN, metadata.token_key, "")
+                if not ck:
+                    skipped_count += 1
+                    continue
+                ck = str(ck)
+                try:
+                    auth_part, phone = parse_ck_from_string(ck)
+                except ValueError:
+                    skipped_count += 1
+                    continue
+                if not YunpanHttpClient.is_token_expiring_soon(auth_part, 5):
+                    skipped_count += 1
+                    continue
+                logger.info("账号 %s (%s) 即将过期 (%s)，尝试刷新...", mask_phone(phone), metadata.token_key, YunpanHttpClient.format_expire_time(auth_part))
+                new_auth = await self.http.refresh_authorization(auth_part, phone)
+                if new_auth:
+                    new_ck = f"{new_auth}#{phone}"
+                    await self.store.set(BUCKET_TOKEN, metadata.token_key, new_ck)
+                    try:
+                        info = CKInfo(user_id=user_id, phone=phone, ck=new_ck, remark=metadata.remark, add_time=self._now_str())
+                        await self._sync_to_qinglong(metadata.token_key, info)
+                    except Exception as exc:
+                        logger.warning("刷新后同步面板失败: %s", exc)
+                    refreshed_count += 1
+                else:
+                    failed_count += 1
+        logger.info("Token 刷新任务完成: 总账号 %d, 刷新成功 %d, 刷新失败 %d, 无需刷新 %d", total_accounts, refreshed_count, failed_count, skipped_count)
+        # 汇总通知到群聊
+        group_id = self._runtime_config().get("refresh_notify_group_id", "")
+        if group_id:
+            message = (
+                "======云盘 Token 刷新报告======\n\n"
+                f"📊 总账号数：{total_accounts}\n"
+                f"🔄 已刷新成功：{refreshed_count}\n"
+                f"❌ 刷新失败：{failed_count}\n"
+                f"⏭️ 无需刷新：{skipped_count}\n\n"
+                "============================"
+            )
+            group_origin = f"aiocqhttp:group:{group_id}"
+            await self._send_to_origin(group_origin, message)
+
+    async def _scheduled_exchange_loop(self) -> None:
+        """定时抢兑任务（10:00, 16:00, 00:00 静默执行）"""
+        try:
+            await asyncio.sleep(40)
+        except asyncio.CancelledError:
+            return
+        exchange_times = [(10, 0), (16, 0), (0, 0)]
+        while True:
+            now = datetime.now()
+            next_time = None
+            for hour, minute in exchange_times:
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                if next_time is None or target < next_time:
+                    next_time = target
+            wait_seconds = (next_time - now).total_seconds()
+            try:
+                await asyncio.sleep(wait_seconds)
+            except asyncio.CancelledError:
+                return
+            logger.info("定时抢兑任务开始执行 (%s)", next_time.strftime("%H:%M"))
+            try:
+                await self._run_scheduled_exchange()
+            except Exception:
+                logger.exception("定时抢兑任务执行失败")
+
+    async def _run_scheduled_exchange(self) -> None:
+        """执行定时抢兑：遍历所有用户，只处理已开启抢兑的账号"""
+        all_user_ids = await self.store.all_keys(BUCKET_USER)
+        for user_id in all_user_ids:
+            metadata_list = await self._get_user_metadata(user_id)
+            user_results: list[str] = []
+            for metadata in metadata_list:
+                exchange_config = await self._get_exchange_config(metadata.token_key)
+                if not exchange_config:
+                    continue
+                ck = await self.store.get(BUCKET_TOKEN, metadata.token_key, "")
+                if not ck:
+                    continue
+                ck = str(ck)
+                try:
+                    auth_part, phone = parse_ck_from_string(ck)
+                except ValueError:
+                    continue
+                account_label = self._get_account_label(metadata, 1)
+                try:
+                    jwt_token = await self._get_jwt_from_ck(ck)
+                    await self.http.prepare_market_session(jwt_token)
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
+                    exchange_result = await self.http.do_exchange(jwt_token, exchange_config.prize_id)
+                    prize_name = str((exchange_result.get("result") or {}).get("prizeName") or exchange_config.prize_name)
+                    user_results.append(f"✅ {account_label} ({mask_phone(phone)})\n🎁 {prize_name}\n📢 兑换成功")
+                    if not exchange_config.is_long_term:
+                        await self.store.delete(BUCKET_EXCHANGE, metadata.token_key)
+                except Exception as exc:
+                    user_results.append(f"❌ {account_label} ({mask_phone(phone)})\n🎁 {exchange_config.prize_name}\n📢 {sanitize_error(exc)}")
+                await asyncio.sleep(random.uniform(1, 2))
+            if user_results:
+                message = "======云盘抢兑结果======\n\n" + "\n\n".join(user_results) + "\n\n============================"
+                await self._notify_user(user_id, message)
+
+    async def _notify_user(self, user_id: str, text: str) -> bool:
+        """向指定用户发送主动通知"""
+        session_info = await self.store.get(BUCKET_SESSION, user_id, {}) or {}
+        origin = session_info.get("origin", "") if isinstance(session_info, dict) else ""
+        if not origin:
+            logger.debug("用户 %s 没有记录会话 origin，跳过通知", mask_user_id(user_id))
+            return False
+        return await self._send_to_origin(origin, text)
 
     def _now_str(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1325,6 +1681,25 @@ class YidongYunpanPlugin(Star):
         summary_origin = getattr(event, "unified_msg_origin", "")
         self._track_task(self._run_batch_check(summary_origin))
 
+    async def _handle_one_click_exchange(self, event: AstrMessageEvent) -> None:
+        """云盘一键抢兑：仅管理员可用，对所有已配置抢兑的账号执行抢兑"""
+        admin_ids = set(self._runtime_config()["admin_user_ids"])
+        if admin_ids and str(event.get_sender_id()) not in admin_ids:
+            await self._send_text(event, "❌ 当前用户没有权限执行「云盘一键抢兑」")
+            return
+        await self._send_text(event, "🚀 已开始一键抢兑，任务正在后台运行...")
+        origin = getattr(event, "unified_msg_origin", "")
+        async def _run():
+            try:
+                await self._run_scheduled_exchange()
+                if origin:
+                    await self._send_to_origin(origin, "✅ 一键抢兑任务执行完成，结果已通知到各账号主人")
+            except Exception as exc:
+                logger.exception("一键抢兑失败")
+                if origin:
+                    await self._send_to_origin(origin, f"❌ 一键抢兑任务执行失败：{sanitize_error(exc)}")
+        self._track_task(_run())
+
     async def _handle_exchange_menu(self, event: AstrMessageEvent) -> None:
         choice = await self._ask_text(
             event,
@@ -1767,6 +2142,10 @@ class YidongYunpanPlugin(Star):
     @filter.command("云盘一键检测")
     async def cmd_check_all_ck(self, event: AstrMessageEvent):
         await self._run_handler(event, self._handle_check_all_ck)
+
+    @filter.command("云盘一键抢兑")
+    async def cmd_one_click_exchange(self, event: AstrMessageEvent):
+        await self._run_handler(event, self._handle_one_click_exchange)
 
     @filter.command("云盘抢兑")
     async def cmd_exchange_menu(self, event: AstrMessageEvent):
